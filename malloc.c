@@ -1,5 +1,6 @@
-#include <unistd.h>    /* sysconf */
-#include <stdio.h>     /* fprintf, only used to print error messages */
+#define _GNU_SOURCE   /* mremap */
+#include <unistd.h>    /* sysconf, write */
+#include <string.h>    /* memcpy, memset */
 #include <stdint.h>    /* uintptr_t, SIZE_MAX */
 #include <pthread.h>   /* pthread_mutex_t */
 #include <sys/mman.h>  /* mmap, munmap */
@@ -119,12 +120,43 @@
  *    it is only there so ThreadSanitizer can show the races the locks prevent
  *    (with per-thread arenas they only show up on cross-thread frees).
  *
+ *
+ * REALLOC, CALLOC AND FRIENDS (Stage 7)
+ * -------------------------------------
+ *  - realloc tries to resize IN PLACE first: shrinking splits off the tail (and merges it
+ *    with a free neighbour), growing swallows a free block that sits right after us.
+ *    Only if that is impossible do we malloc + copy + free. Big mmap'd blocks use mremap,
+ *    which lets the kernel move the pages without copying any bytes.
+ *  - calloc checks n * size for overflow, and skips the memset for freshly mmap'd blocks
+ *    (the OS already hands those out zeroed).
+ *  - memalign / posix_memalign / aligned_alloc: anything up to ALIGNMENT is a normal block.
+ *    Bigger alignments get their own mmap, with a header placed right before the aligned
+ *    payload that remembers where the mapping really starts (arena_id LARGE_ALIGNED_ID).
+ *
+ *
+ * RUNNING INSIDE OTHER PROGRAMS (LD_PRELOAD)
+ * ------------------------------------------
+ * preload.c exports the standard names (malloc, free, ...) so this file can be built into
+ * libmyalloc.so and swapped in under a real program. That puts extra rules on this file:
+ *  - we may never call anything that calls malloc (printf, fopen, ...) because malloc IS us.
+ *    Error messages therefore use write(2) directly.
+ *  - the per-thread arena pointer uses the "initial-exec" TLS model, so reading it never
+ *    triggers the dynamic loader (which allocates memory).
+ *  - fork(): another thread might hold an arena lock at the moment of the fork, and the child
+ *    would wait for it forever. pthread_atfork handlers take every lock before the fork and
+ *    release them in both parent and child.
+ *  - build with -DMY_ALLOC_SINGLE_ARENA to put every thread in ONE arena. That is the
+ *    "one global lock" design built from the same code, used as the benchmark baseline.
+ *
  * Known limitations (also good things to say out loud in an interview):
  *  - chunks are never returned to the OS, they are only reused
  *  - if a thread's arena is out of memory we fail, we don't borrow from others
  *  - threads are spread over MAX_ARENAS arenas round-robin; past that they share
  *  - an arena is not recycled when its thread exits
  *  - double-freeing a LARGE block is not detected (the memory is already unmapped)
+ *  - an over-aligned request (alignment > ALIGNMENT) costs at least one whole page
+ *  - freeing a pointer that did not come from us is only caught by cheap checks (alignment and
+ *    the arena id), so it may still crash. real programs do not do this
  */
 
 
@@ -142,6 +174,25 @@
 
 //arena_id used by blocks that were mmap'd on their own
 #define LARGE_ARENA_ID (-1)
+
+//arena_id used by mmap'd blocks that were asked for with a big alignment (see large_aligned_alloc)
+#define LARGE_ALIGNED_ID (-2)
+
+//TEST ONLY: -DMY_ALLOC_TEST_SLOW_LOCK makes every thread linger inside its critical section, so
+//tests can reliably make a fork() land while a lock is held (otherwise the window is far too small
+//to hit). never use it for real
+#ifdef MY_ALLOC_TEST_SLOW_LOCK
+#define LINGER() usleep(30)
+#else
+#define LINGER() ((void)0)
+#endif
+
+//with -DMY_ALLOC_SINGLE_ARENA every thread shares arena 0 (the one-global-lock baseline)
+#ifdef MY_ALLOC_SINGLE_ARENA
+#define ARENA_LIMIT (1)
+#else
+#define ARENA_LIMIT (MAX_ARENAS)
+#endif
 
 //every payload address we return is a multiple of this. 64 = one cache line (see the ALIGNMENT
 //section at the top). real malloc uses 16. can be changed at build time: -DMY_ALLOC_ALIGNMENT=16
@@ -249,7 +300,9 @@ static pthread_mutex_t arena_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static int next_arena_id = 0;
 
 //each thread remembers its own arena. __thread gives every thread its own copy of this variable
-static __thread arena_t* thread_arena = NULL;
+//initial-exec: the variable lives at a fixed spot reachable without calling into the dynamic
+//loader, which matters when we are preloaded (the loader would call malloc, which is us)
+static __thread arena_t* thread_arena __attribute__((tls_model("initial-exec"))) = NULL;
 
 //bytes currently held by large (directly mmap'd) blocks. updated with atomics, no lock
 static size_t large_mapped_bytes = 0;
@@ -264,6 +317,43 @@ static size_t large_mapped_bytes = 0;
 
 
 /* INITIALIZE THE HELPER FUNCTIONS*/
+
+//copy a string onto the end of buf (never past cap)
+static void append_text(char* buf, size_t* len, size_t cap, const char* text){
+    while(*text != '\0' && *len < cap){
+        buf[*len] = *text;
+        (*len)++;
+        text++;
+    }
+}
+
+//print "<who><message> (at 0x...)" to stderr WITHOUT stdio. printf/fprintf can call malloc, and
+//when we are preloaded under a real program malloc is us, so that would recurse forever
+static void log_error(const char* who, const char* message, void* where){
+    char buf[200];
+    size_t len = 0;
+    append_text(buf, &len, sizeof(buf) - 24, who);
+    append_text(buf, &len, sizeof(buf) - 24, message);
+    append_text(buf, &len, sizeof(buf) - 24, " (at 0x");
+
+    //write the address as hex digits, most significant first
+    char digits[17];
+    int count = 0;
+    uintptr_t value = (uintptr_t)where;
+    do{
+        digits[count++] = "0123456789abcdef"[value & 0xF];
+        value >>= 4;
+    } while(value != 0);
+    while(count > 0){
+        buf[len++] = digits[--count];
+    }
+    buf[len++] = ')';
+    buf[len++] = '\n';
+
+    //nothing sensible to do if the write fails, we are already reporting an error
+    ssize_t ignored = write(2, buf, len);
+    (void)ignored;
+}
 
 //turn what the user asked for into the payload size we actually use.
 //the WHOLE block (header + payload + footer) has to be a multiple of ALIGNMENT, so we round
@@ -499,7 +589,7 @@ static arena_t* get_thread_arena(void){
     //slow path (once per thread): pick the next arena in round-robin order
     pthread_mutex_lock(&arena_table_lock);
 
-    int id = next_arena_id % MAX_ARENAS;
+    int id = next_arena_id % ARENA_LIMIT;
     next_arena_id++;
 
     arena_t* a = &arenas[id];
@@ -563,7 +653,7 @@ static void free_unlocked(arena_t* a, header* block){
 
     //catch double frees instead of corrupting the free list
     if(block -> is_free == 1){
-        fprintf(stderr, "my_free: double free detected on %p\n", (void*)((char*)block + sizeof(header)));
+        log_error("my_free: ", "double free detected", (char*)block + sizeof(header));
         return;
     }
 
@@ -575,6 +665,51 @@ static void free_unlocked(arena_t* a, header* block){
 
     //put the (possibly bigger) block into the right bin
     add_to_free_list(a, block);
+}
+
+
+//if an allocated block has more room than "need", give the extra back as its own free block.
+//(the extra may touch a free block after it, so it is merged with that one)
+static void trim_block(arena_t* a, header* block, size_t need){
+    size_t leftover = block -> size - need;
+
+    //same rule as place_block: only split if the leftover can be a real block
+    if(leftover >= OVERHEAD + MIN_PAYLOAD){
+        block -> size = need;
+        set_footer(block);
+
+        header* remainder = next_block(block);
+        remainder -> size = leftover - OVERHEAD;
+        remainder -> is_free = 1;
+        remainder -> arena_id = a -> id;
+        set_footer(remainder);
+
+        //merge with a free block after it (our block is in use, so nothing to merge with before it)
+        remainder = coalesce(a, remainder);
+        add_to_free_list(a, remainder);
+    }
+}
+
+//try to resize an allocated arena block WITHOUT moving it. returns 1 on success, 0 if it won't fit.
+//need is the new payload size, already rounded by payload_size_for
+static int realloc_in_place(arena_t* a, header* block, size_t need){
+
+    //growing: only possible if the block right after us is free and the two together are big enough
+    if(need > block -> size){
+        header* after = next_block(block);
+        if(after -> is_free != 1 || block -> size + OVERHEAD + after -> size < need){
+            return 0;
+        }
+
+        //swallow the free block (header, footer and all)
+        remove_from_free_list(a, after);
+        block -> size = block -> size + OVERHEAD + after -> size;
+        set_footer(block);
+    }
+
+    //if we now have more than we need (shrinking, or swallowed a big block), hand the tail back
+    trim_block(a, block, need);
+    return 1;
 }
 
 
@@ -605,13 +740,90 @@ static void* large_alloc(size_t size){
 }
 
 static void large_free(header* block){
-    //walk back to where the mapping really starts
-    void* base = (char*)block - HEADER_OFFSET;
-    size_t total = HEADER_OFFSET + sizeof(header) + block -> size;
+    void* base;
+    size_t total;
+
+    if(block -> arena_id == LARGE_ALIGNED_ID){
+        //an over-aligned block stored where its mapping starts and how long it is
+        base = (void*)block -> next;
+        total = (size_t)(uintptr_t)block -> prev;
+    }
+    else{
+        //walk back to where the mapping really starts
+        base = (char*)block - HEADER_OFFSET;
+        total = HEADER_OFFSET + sizeof(header) + block -> size;
+    }
     __atomic_fetch_sub(&large_mapped_bytes, total, __ATOMIC_RELAXED);
 
     //give the pages straight back to the OS
     munmap(base, total);
+}
+
+//a block whose payload must start on a boundary bigger than ALIGNMENT (ex: 4096 for a page).
+//we map extra room, pick the first aligned spot, and put the header right in front of it.
+//(an allocated block never uses next/prev, so we borrow them to remember the mapping)
+static void* large_aligned_alloc(size_t alignment, size_t size){
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+
+    //worst case we skip alignment - 1 bytes to find an aligned spot, plus a header in front of it
+    size_t total;
+    if(__builtin_add_overflow(size, alignment + sizeof(header), &total)){
+        return NULL;
+    }
+    if(__builtin_add_overflow(total, page - 1, &total)){
+        return NULL;
+    }
+    total &= ~(page - 1);
+
+    void* raw = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if(raw == MAP_FAILED){
+        return NULL;
+    }
+
+    //first address at least a header past the start that is a multiple of alignment
+    uintptr_t payload = ((uintptr_t)raw + sizeof(header) + alignment - 1) & ~(uintptr_t)(alignment - 1);
+
+    header* block = (header*)(payload - sizeof(header));
+    block -> size = (size_t)((uintptr_t)raw + total - payload);
+    block -> is_free = 0;
+    block -> arena_id = LARGE_ALIGNED_ID;
+    block -> next = (header*)raw;
+    block -> prev = (header*)(uintptr_t)total;
+
+    __atomic_fetch_add(&large_mapped_bytes, total, __ATOMIC_RELAXED);
+
+    return (void*)payload;
+}
+
+//resize a LARGE_ARENA_ID block (new payload size need is already rounded and still >= LARGE_THRESHOLD).
+//mremap lets the kernel move or stretch the pages, so no bytes are copied. returns NULL on failure
+//and leaves the old block alone
+static void* large_realloc(header* block, size_t need){
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size_t old_total = HEADER_OFFSET + sizeof(header) + block -> size;
+    size_t new_total = (HEADER_OFFSET + sizeof(header) + need + page - 1) & ~(page - 1);
+
+    if(new_total == old_total){
+        return (char*)block + sizeof(header);
+    }
+
+    void* new_base = mremap((char*)block - HEADER_OFFSET, old_total, new_total, MREMAP_MAYMOVE);
+    if(new_base == MAP_FAILED){
+        return NULL;
+    }
+
+    //the header moved with the pages, just fix its size
+    header* moved = (header*)((char*)new_base + HEADER_OFFSET);
+    moved -> size = new_total - HEADER_OFFSET - sizeof(header);
+
+    if(new_total > old_total){
+        __atomic_fetch_add(&large_mapped_bytes, new_total - old_total, __ATOMIC_RELAXED);
+    }
+    else{
+        __atomic_fetch_sub(&large_mapped_bytes, old_total - new_total, __ATOMIC_RELAXED);
+    }
+
+    return (char*)moved + sizeof(header);
 }
 
 
@@ -619,7 +831,7 @@ static void large_free(header* block){
 
 //print what went wrong and return 0 so the caller can do: return report(...)
 static int report(const char* message, void* where){
-    fprintf(stderr, "my_heap_check: %s (at %p)\n", message, where);
+    log_error("my_heap_check: ", message, where);
     return 0;
 }
 
@@ -789,9 +1001,38 @@ void* my_malloc(size_t size){
 
     LOCK_ARENA(a);
     void* result = malloc_unlocked(a, size);
+    LINGER();
     UNLOCK_ARENA(a);
 
     return result;
+}
+
+//turns a pointer the user gave us back into its block header, or returns NULL (after
+//printing why) if it cannot possibly be ours. these are cheap checks, not a guarantee
+static header* block_from_ptr(void* ptr, const char* who){
+
+    //real pointers are always aligned
+    if((uintptr_t)ptr % ALIGNMENT != 0){
+        log_error(who, "pointer was not allocated by my_malloc", ptr);
+        return NULL;
+    }
+
+    //the header sits right before the payload we handed out
+    header* block = (header*)((char*)ptr - sizeof(header));
+
+    //the header tells us which arena owns this block
+    int id = block -> arena_id;
+
+    if(id == LARGE_ARENA_ID || id == LARGE_ALIGNED_ID){
+        return block;
+    }
+
+    if(id < 0 || id >= MAX_ARENAS || arena_ready(&arenas[id]) == 0){
+        log_error(who, "pointer was not allocated by my_malloc", ptr);
+        return NULL;
+    }
+
+    return block;
 }
 
 void my_free(void* ptr){
@@ -801,26 +1042,17 @@ void my_free(void* ptr){
         return;
     }
 
-    //real pointers are always 16 byte aligned
-    if((uintptr_t)ptr % ALIGNMENT != 0){
-        fprintf(stderr, "my_free: pointer %p was not allocated by my_malloc\n", ptr);
+    header* block = block_from_ptr(ptr, "my_free: ");
+    if(block == NULL){
         return;
     }
 
-    //the header sits right before the payload we handed out
-    header* block = (header*)((char*)ptr - sizeof(header));
-
-    //the header tells us which arena owns this block. NOTE: this is the OWNER, which
-    //may not be the calling thread's arena (that is a cross-thread free)
+    //NOTE: this is the OWNER arena, which may not be the calling thread's arena
+    //(that is a cross-thread free)
     int id = block -> arena_id;
 
-    if(id == LARGE_ARENA_ID){
+    if(id == LARGE_ARENA_ID || id == LARGE_ALIGNED_ID){
         large_free(block);
-        return;
-    }
-
-    if(id < 0 || id >= MAX_ARENAS || arena_ready(&arenas[id]) == 0){
-        fprintf(stderr, "my_free: pointer %p was not allocated by my_malloc\n", ptr);
         return;
     }
 
@@ -829,7 +1061,131 @@ void my_free(void* ptr){
 
     LOCK_ARENA(a);
     free_unlocked(a, block);
+    LINGER();
     UNLOCK_ARENA(a);
+}
+
+void* my_realloc(void* ptr, size_t size){
+
+    //realloc(NULL, n) is just malloc(n)
+    if(ptr == NULL){
+        return my_malloc(size);
+    }
+
+    //realloc(p, 0) frees the block
+    if(size < 1){
+        my_free(ptr);
+        return NULL;
+    }
+
+    if(size > SIZE_MAX / 2){
+        return NULL;
+    }
+
+    header* block = block_from_ptr(ptr, "my_realloc: ");
+    if(block == NULL){
+        return NULL;
+    }
+
+    size_t need = payload_size_for(size);
+    int id = block -> arena_id;
+    size_t old_size;
+
+    if(id == LARGE_ARENA_ID){
+        //staying big: let the kernel resize the mapping, no copying
+        if(need >= LARGE_THRESHOLD){
+            return large_realloc(block, need);
+        }
+        old_size = block -> size;
+    }
+    else if(id == LARGE_ALIGNED_ID){
+        old_size = block -> size;
+    }
+    else{
+        arena_t* a = &arenas[id];
+
+        LOCK_ARENA(a);
+
+        if(block -> is_free == 1){
+            UNLOCK_ARENA(a);
+            log_error("my_realloc: ", "block is already free", ptr);
+            return NULL;
+        }
+
+        //first choice: resize where it sits
+        if(realloc_in_place(a, block, need)){
+            UNLOCK_ARENA(a);
+            return ptr;
+        }
+
+        //read the size while we still hold the lock
+        old_size = block -> size;
+        UNLOCK_ARENA(a);
+    }
+
+    //second choice: new block, copy, free the old one. (no lock is held here, my_malloc and
+    //my_free take their own, so we never hold two arena locks at once)
+    void* fresh = my_malloc(size);
+    if(fresh == NULL){
+        return NULL;
+    }
+
+    memcpy(fresh, ptr, old_size < size ? old_size : size);
+    my_free(ptr);
+    return fresh;
+}
+
+void* my_calloc(size_t count, size_t size){
+
+    //count * size can wrap around to a small number, which would hand out too little memory
+    size_t total;
+    if(__builtin_mul_overflow(count, size, &total)){
+        return NULL;
+    }
+
+    void* p = my_malloc(total);
+    if(p == NULL){
+        return NULL;
+    }
+
+    //a block that was just mmap'd is already zero, so only arena blocks need clearing
+    header* block = (header*)((char*)p - sizeof(header));
+    if(block -> arena_id != LARGE_ARENA_ID){
+        memset(p, 0, total);
+    }
+
+    return p;
+}
+
+void* my_memalign(size_t alignment, size_t size){
+
+    //alignment must be a power of two
+    if(alignment == 0 || (alignment & (alignment - 1)) != 0){
+        return NULL;
+    }
+    if(size < 1 || size > SIZE_MAX / 2){
+        return NULL;
+    }
+
+    //our normal blocks are already aligned this well
+    if(alignment <= ALIGNMENT){
+        return my_malloc(size);
+    }
+
+    return large_aligned_alloc(alignment, size);
+}
+
+size_t my_usable_size(void* ptr){
+    if(ptr == NULL){
+        return 0;
+    }
+
+    header* block = block_from_ptr(ptr, "my_usable_size: ");
+    if(block == NULL || block -> is_free == 1){
+        return 0;
+    }
+
+    return block -> size;
 }
 
 //throw away everything we know and start over. Meant for tests, call it when no other
@@ -947,4 +1303,35 @@ void my_heap_stats(my_heap_stats_t* stats){
     size_t large_bytes = __atomic_load_n(&large_mapped_bytes, __ATOMIC_RELAXED);
     stats -> mapped_bytes += large_bytes;
     stats -> used_bytes += large_bytes;
+}
+
+
+/* FORK SAFETY */
+
+//fork() copies only the thread that called it. if another thread was holding an arena lock at that
+//moment, the child would own a lock nobody will ever release and hang on its first malloc.
+//the fix: take every lock just before the fork so none is held by anyone else, then release
+//them in both the parent and the child. (locks are always taken in the same order: table, then arenas by id)
+static void fork_prepare(void){
+    pthread_mutex_lock(&arena_table_lock);
+    for(int i = 0; i < MAX_ARENAS; i++){
+        if(arena_ready(&arenas[i])){
+            LOCK_ARENA(&arenas[i]);
+        }
+    }
+}
+
+static void fork_release(void){
+    for(int i = MAX_ARENAS - 1; i >= 0; i--){
+        if(arena_ready(&arenas[i])){
+            UNLOCK_ARENA(&arenas[i]);
+        }
+    }
+    pthread_mutex_unlock(&arena_table_lock);
+}
+
+//runs once when the program (or the preloaded library) starts, before main
+__attribute__((constructor))
+static void register_fork_handlers(void){
+    pthread_atfork(fork_prepare, fork_release, fork_release);
 }

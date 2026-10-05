@@ -17,41 +17,52 @@
 /*
  * my_heap_init
  * ------------
- * (Re)initializes the allocator's internal state. Must be called once
- * before any my_malloc/my_free calls. Tests call this in their setup
- * so each test starts from a clean heap.
- *
- * Milestone 1.
+ * Throws away everything the allocator knows and starts over (memory goes back to the OS).
+ * Tests call this in their setup so each test starts from a clean heap. Only call it when no
+ * other thread is using the allocator. Normal programs never need it.
  */
 void my_heap_init(void);
 
 /*
- * my_malloc / my_free
- * --------------------
- * Drop-in replacements for malloc()/free(), backed entirely by memory
- * this allocator requested from the OS via sbrk() — never by calling
- * the real malloc/free internally.
+ * my_malloc / my_free / my_realloc / my_calloc
+ * ---------------------------------------------
+ * Drop-in replacements for malloc/free/realloc/calloc, backed entirely by memory this
+ * allocator maps from the OS with mmap(), never by calling the real malloc internally.
+ *   my_malloc(0)  returns NULL (the libmyalloc.so wrappers return a real pointer instead)
+ *   my_realloc    resizes in place when it can, and follows the usual rules:
+ *                 realloc(NULL, n) == malloc(n), realloc(p, 0) frees p and returns NULL,
+ *                 and on failure the old block is left untouched
+ *   my_calloc     returns zeroed memory and fails (NULL) if count * size overflows
  */
 void *my_malloc(size_t size);
 void  my_free(void *ptr);
+void *my_realloc(void *ptr, size_t size);
+void *my_calloc(size_t count, size_t size);
 
 /*
- * my_realloc — stretch goal, Milestone 7. Not required for the core
- * resume bullets, implement last if you have time.
+ * my_memalign
+ * -----------
+ * Like memalign: returns memory whose address is a multiple of "alignment" (a power of two).
+ * Alignments up to MY_ALLOC_ALIGNMENT cost nothing extra; bigger ones cost at least a page.
+ * Free it with my_free like any other block.
  */
-void *my_realloc(void *ptr, size_t size);
+void *my_memalign(size_t alignment, size_t size);
+
+/*
+ * my_usable_size
+ * --------------
+ * How many bytes you may actually use in this block (can be more than you asked for).
+ * Returns 0 for NULL or a block that is already free.
+ */
+size_t my_usable_size(void *ptr);
 
 /*
  * my_heap_check
  * -------------
  * Debug/consistency checker: walks the entire heap (not just the free
- * list) and verifies invariants (header/footer sizes match, no two
- * adjacent free blocks, free-list only contains blocks marked free,
- * etc). Returns 1 if healthy, 0 and prints a diagnostic otherwise.
- *
- * You will write this in Milestone 5 — it is your own mini-Valgrind,
- * and writing it is what makes debugging heap corruption tractable
- * instead of guesswork.
+ * lists) and verifies invariants (header/footer sizes match, no two
+ * adjacent free blocks, every free list only holds free blocks of the
+ * right size, etc). Returns 1 if healthy, 0 and prints a diagnostic otherwise.
  */
 int my_heap_check(void);
 

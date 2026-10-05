@@ -11,10 +11,10 @@
 /*
  * MULTITHREADED STRESS TEST
  * -------------------------
- * Phase 1 (private):  every thread randomly mallocs/frees its own blocks and
+ * Phase 1 (private):  every thread randomly mallocs/reallocs/frees its own blocks and
  *                     checks that nobody else overwrote them.
  * Phase 2 (hand-off): thread i keeps allocating blocks and passing them to
- *                     thread i+1, which frees them WHILE thread i is still
+ *                     thread i+1, which reallocs and frees them WHILE thread i is still
  *                     allocating. This is the "cross-thread free" case, the one
  *                     real allocators have to be most careful about.
  * If the lock were missing, the free list would be corrupted and either a
@@ -91,7 +91,18 @@ static void* worker(void* arg){
     for(int i = 0; i < iterations; i++){
         int slot = rand_r(&seed) % SLOTS;
 
-        if(ptrs[slot] != NULL){
+        if(ptrs[slot] != NULL && rand_r(&seed) % 3 == 0){
+            //resize it (sometimes in place, sometimes moved). the bytes we had must survive
+            size_t new_size = (size_t)(rand_r(&seed) % 600 + 1);
+            void* p = my_realloc(ptrs[slot], new_size);
+            if(p == NULL){ thread_failed[id] = 1; continue; }
+            size_t keep = sizes[slot] < new_size ? sizes[slot] : new_size;
+            if(!pattern_ok(p, keep, tags[slot])) thread_failed[id] = 1;
+            memset(p, tags[slot], new_size);
+            ptrs[slot] = p;
+            sizes[slot] = new_size;
+        }
+        else if(ptrs[slot] != NULL){
             if(!pattern_ok(ptrs[slot], sizes[slot], tags[slot])) thread_failed[id] = 1;
             my_free(ptrs[slot]);
             ptrs[slot] = NULL;
@@ -142,6 +153,16 @@ static void* worker(void* arg){
         size_t qsize;
         if(consumed < handoff_items && mailbox_pop(&mailbox[from], &q, &qsize)){
             if(!pattern_ok(q, qsize, (unsigned char)(from + 1))) thread_failed[id] = 1;
+
+            //resize a block another thread allocated (the owner is allocating from the same arena right now)
+            size_t new_size = (size_t)(rand_r(&seed) % 500 + 1);
+            void* r = my_realloc(q, new_size);
+            if(r == NULL){ thread_failed[id] = 1; }
+            else{
+                size_t keep = qsize < new_size ? qsize : new_size;
+                if(!pattern_ok(r, keep, (unsigned char)(from + 1))) thread_failed[id] = 1;
+                q = r;
+            }
             my_free(q);                                //free memory another thread allocated
             consumed++;
         }

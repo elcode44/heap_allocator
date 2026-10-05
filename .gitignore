@@ -11,3 +11,7 @@ bench_glibc
 bench_memory_*
 *.o
 *.so
+tests_fork
+tests_fork_tsan
+bench_threads
+results/
