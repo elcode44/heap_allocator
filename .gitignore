@@ -1,0 +1,13 @@
+# build outputs
+main
+tests
+tests_mt
+tests_mt_tsan
+tests_mt_nolock
+tests_a
+tests_mt_a
+bench
+bench_glibc
+bench_memory_*
+*.o
+*.so
